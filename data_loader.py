@@ -24,106 +24,95 @@ def load_elo_ratings(filepath=None):
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"No se encontró {filepath}")
     elo_df = pd.read_csv(filepath)
-    # Convertir fechas (importante)
     elo_df['date'] = pd.to_datetime(elo_df['date'], errors='coerce')
-    # Eliminar filas con fechas inválidas
     elo_df = elo_df.dropna(subset=['date'])
     elo_df = elo_df.sort_values('date')
-    # Asegurar columna 'elo'
     if 'rating' in elo_df.columns:
         elo_df = elo_df.rename(columns={'rating': 'elo'})
-    # Asegurar que 'elo' sea numérico
     elo_df['elo'] = pd.to_numeric(elo_df['elo'], errors='coerce')
     return elo_df
 
-def merge_elo_to_matches(df, elo_df, initial_elo=1500):
-    df = df.copy()
-    df['home_elo'] = initial_elo
-    df['away_elo'] = initial_elo
-    for idx, row in df.iterrows():
+def get_last_elo_before_date(team, date, elo_df, default=1500):
+    """Retorna el último Elo del equipo antes de una fecha específica."""
+    hist = elo_df[(elo_df['team'] == team) & (elo_df['date'] < date)]
+    if not hist.empty:
+        return hist.iloc[-1]['elo']
+    return default
+
+def get_team_avg_goals(team, date, df, as_home=True, window=5):
+    """Promedio de goles anotados (as_home=True) o recibidos (as_home=False) en últimos window partidos antes de date."""
+    if as_home:
+        matches = df[(df['home_team'] == team) & (df['date'] < date)].sort_values('date').tail(window)
+        goals = matches['home_score']
+    else:
+        matches = df[(df['away_team'] == team) & (df['date'] < date)].sort_values('date').tail(window)
+        goals = matches['away_score']
+    if not goals.empty:
+        return goals.mean()
+    return 1.0  # valor neutral
+
+def get_team_form(team, date, df, window=5):
+    """Puntos promedio en últimos window partidos (3 victoria, 1 empate, 0 derrota)."""
+    home_matches = df[(df['home_team'] == team) & (df['date'] < date)].sort_values('date').tail(window)
+    away_matches = df[(df['away_team'] == team) & (df['date'] < date)].sort_values('date').tail(window)
+    all_matches = pd.concat([
+        home_matches[['date', 'home_team', 'away_team', 'home_score', 'away_score']],
+        away_matches[['date', 'home_team', 'away_team', 'home_score', 'away_score']]
+    ]).sort_values('date').tail(window)
+    points = 0
+    for _, m in all_matches.iterrows():
+        if m['home_team'] == team:
+            if m['home_score'] > m['away_score']:
+                points += 3
+            elif m['home_score'] == m['away_score']:
+                points += 1
+        else:
+            if m['away_score'] > m['home_score']:
+                points += 3
+            elif m['away_score'] == m['home_score']:
+                points += 1
+    return points / window if len(all_matches) > 0 else 1.5
+
+def filter_worldcup_and_qualifiers(df, start_year=1990, end_year=2025):
+    """Filtra partidos de World Cup y eliminatorias entre dos años."""
+    mask = df['tournament'].str.contains('World Cup', case=False, na=False)
+    wc_data = df[mask].copy()
+    wc_data = wc_data[(wc_data['date'].dt.year >= start_year) & (wc_data['date'].dt.year <= end_year)]
+    return wc_data
+
+def build_training_data(df, elo_df, start_year=1990, end_year=2025):
+    """Construye X, y para el modelo Poisson."""
+    df_filtered = filter_worldcup_and_qualifiers(df, start_year, end_year)
+    features = []
+    home_goals = []
+    away_goals = []
+    for idx, row in df_filtered.iterrows():
         match_date = row['date']
         home = row['home_team']
         away = row['away_team']
-        home_hist = elo_df[(elo_df['team'] == home) & (elo_df['date'] < match_date)]
-        if not home_hist.empty:
-            df.at[idx, 'home_elo'] = home_hist.iloc[-1]['elo']
-        away_hist = elo_df[(elo_df['team'] == away) & (elo_df['date'] < match_date)]
-        if not away_hist.empty:
-            df.at[idx, 'away_elo'] = away_hist.iloc[-1]['elo']
-    return df
-
-def compute_rolling_features(df, window=5):
-    df['home_attack'] = np.nan
-    df['away_defense'] = np.nan
-    df['home_form'] = np.nan
-    teams = set(df['home_team']).union(set(df['away_team']))
-    for team in teams:
-        team_home = df[df['home_team'] == team].sort_values('date')
-        if not team_home.empty:
-            team_home['goals'] = team_home['home_score']
-            team_home['rolling'] = team_home['goals'].rolling(window, min_periods=1).mean()
-            for idx, val in team_home['rolling'].items():
-                df.at[idx, 'home_attack'] = val
-        team_away = df[df['away_team'] == team].sort_values('date')
-        if not team_away.empty:
-            team_away['conceded'] = team_away['home_score']
-            team_away['rolling_def'] = team_away['conceded'].rolling(window, min_periods=1).mean()
-            for idx, val in team_away['rolling_def'].items():
-                df.at[idx, 'away_defense'] = val
-        all_matches = pd.concat([
-            team_home[['date', 'home_team', 'away_team', 'home_score', 'away_score']],
-            team_away[['date', 'home_team', 'away_team', 'home_score', 'away_score']]
-        ]).sort_values('date').drop_duplicates(subset='date')
-        points = []
-        for _, m in all_matches.iterrows():
-            if m['home_team'] == team:
-                if m['home_score'] > m['away_score']:
-                    p = 3
-                elif m['home_score'] == m['away_score']:
-                    p = 1
-                else:
-                    p = 0
-            else:
-                if m['away_score'] > m['home_score']:
-                    p = 3
-                elif m['away_score'] == m['home_score']:
-                    p = 1
-                else:
-                    p = 0
-            points.append(p)
-        all_matches['points'] = points
-        all_matches['form'] = all_matches['points'].rolling(window, min_periods=1).mean()
-        for _, m in all_matches.iterrows():
-            idx = m.name
-            if idx in df.index:
-                if df.loc[idx, 'home_team'] == team or df.loc[idx, 'away_team'] == team:
-                    df.at[idx, 'home_form'] = m['form']
-    df['home_attack'] = df['home_attack'].fillna(df['home_score'].mean())
-    df['away_defense'] = df['away_defense'].fillna(df['away_score'].mean())
-    df['home_form'] = df['home_form'].fillna(1.5)
-    return df
-
-def filter_worldcup_matches(df, exclude_year=None):
-    mask = df['tournament'].str.contains('World Cup', case=False, na=False)
-    wc_data = df[mask].copy()
-    if exclude_year:
-        wc_data = wc_data[wc_data['date'].dt.year < exclude_year]
-    return wc_data
-
-def prepare_data_for_training(df, elo_df, exclude_year=2026):
-    df_filtered = filter_worldcup_matches(df, exclude_year)
-    df_filtered = merge_elo_to_matches(df_filtered, elo_df)
-    df_filtered = compute_rolling_features(df_filtered)
-    if 'neutral' not in df_filtered.columns:
-        df_filtered['neutral'] = 0
-    feature_cols = ['home_elo', 'away_elo', 'home_attack', 'away_defense', 'home_form', 'neutral']
-    X = df_filtered[feature_cols].fillna(0)
-    y = df_filtered[['home_score', 'away_score']]
-    return X, y, df_filtered
+        neutral = 1 if 'neutral' in row and row['neutral'] == 1 else 0
+        # Elo
+        elo_home = get_last_elo_before_date(home, match_date, elo_df)
+        elo_away = get_last_elo_before_date(away, match_date, elo_df)
+        diff_elo = elo_home - elo_away
+        # Ataque/defensa
+        home_attack = get_team_avg_goals(home, match_date, df, as_home=True)
+        away_defense = get_team_avg_goals(away, match_date, df, as_home=False)
+        away_attack = get_team_avg_goals(away, match_date, df, as_home=True)
+        home_defense = get_team_avg_goals(home, match_date, df, as_home=False)
+        form_home = get_team_form(home, match_date, df)
+        form_away = get_team_form(away, match_date, df)
+        features.append([diff_elo, home_attack, away_defense, away_attack, home_defense, form_home, form_away, neutral])
+        home_goals.append(row['home_score'])
+        away_goals.append(row['away_score'])
+    X = pd.DataFrame(features, columns=['diff_elo', 'home_attack', 'away_defense', 'away_attack', 'home_defense', 'form_home', 'form_away', 'neutral'])
+    y_home = np.array(home_goals)
+    y_away = np.array(away_goals)
+    return X, y_home, y_away
 
 if __name__ == "__main__":
     df = load_results()
     elo = load_elo_ratings()
-    print(f"Partidos totales: {len(df)}")
-    X, y, _ = prepare_data_for_training(df, elo, exclude_year=2026)
-    print(f"Características: {X.shape}, Objetivos: {y.shape}")
+    X, y_home, y_away = build_training_data(df, elo)
+    print(f"Datos de entrenamiento: {X.shape[0]} partidos")
+    print(X.head())
