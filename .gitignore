@@ -1,0 +1,19 @@
+# Entorno virtual
+venv/
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+
+# Configuración de VS Code
+.vscode/
+
+# Datos (Opcional: Si quieres ignorar los procesados)
+data/processed/
+
+# Modelos (Opcional: Si quieres que cada quien entrene el suyo)
+*.pkl
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
